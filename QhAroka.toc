@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: QhAroka (Shaman Raid Healer)
+## Notes: Smart Shaman raid healer - /aroka (downrank), /arokamax (max rank). Prioritizes Chain Heal clusters, Fever Dream → Healing Wave, else Lesser Healing Wave. Healing Way targets preferred.
+## Author: You & Sebastian
+## Version: 1.0
+## DefaultLocale: enUS
+
+QhAroka.lua
