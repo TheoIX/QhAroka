@@ -1,5 +1,6 @@
 -- QhAroka (Shaman) – Turtle WoW 1.12
 -- Downranking + smart targeting + emergency Ancestral Swiftness + LOS blacklist + Healing Way priority
+-- Updated: Buff detection now uses tooltip scanning (safe on Turtle 1.12 where UnitBuff returns textures)
 -- Rules:
 --   • Do nothing if nobody is injured (<100%).
 --   • Self is TOP PRIORITY only if self < 50% HP.
@@ -52,12 +53,21 @@ local function Aroka_BuildScanList()
     return units
 end
 
--- ===== Simple buff partial match =====
-local function HasBuff(unit, partial)
+-- ===== Tooltip-based aura detection (works on Turtle 1.12) =====
+local function HasBuff(unit, name)
     for i = 1, 40 do
-        local buff = UnitBuff(unit, i)
-        if not buff then break end
-        if string.find(buff, partial) then return true end
+        GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        GameTooltip:ClearLines()
+        if GameTooltip.SetUnitBuff then GameTooltip:SetUnitBuff(unit, i) end
+        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+        if text and string.find(text, name, 1, true) then return true end
+    end
+    for i = 1, 40 do
+        GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        GameTooltip:ClearLines()
+        if GameTooltip.SetUnitDebuff then GameTooltip:SetUnitDebuff(unit, i) end
+        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+        if text and string.find(text, name, 1, true) then return true end
     end
     return false
 end
@@ -291,6 +301,25 @@ end
 local function Aroka_Run(forceMax)
     if not Aroka_AnyoneInjured() then return end
 
+    -- NEW: If Ancestral Swiftness buff is currently on the player,
+    -- force exactly one Healing Wave, then return to normal logic on next press.
+    if HasBuff("player", "Ancestral Swiftness") then
+        local u = Aroka_GetBestTarget("Healing Wave")
+        if u then
+            if forceMax then
+                Aroka_SafeCastOnUnitByName("Healing Wave", u)
+            else
+                local r = Aroka_PickRank("Healing Wave", u)
+                if r then
+                    Aroka_SafeCastOnUnitByName(string.format("%s(Rank %d)", "Healing Wave", r), u)
+                else
+                    Aroka_SafeCastOnUnitByName("Healing Wave", u)
+                end
+            end
+        end
+        return
+    end
+
     -- 0) Emergency: Ancestral Swiftness + Healing Wave on ally <50%
     local u_crit = Aroka_FindCriticalTarget(0.50)
     if u_crit and IsSpellReady("Ancestral Swiftness") then
@@ -397,4 +426,3 @@ aroka_errf:SetScript("OnEvent", function()
         end
     end
 end)
-
