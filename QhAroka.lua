@@ -1,5 +1,5 @@
 -- QhAroka (Shaman) – Turtle WoW 1.12
--- Downranking + smart targeting + emergency Ancestral Swiftness
+-- Downranking + smart targeting + emergency Ancestral Swiftness + LOS blacklist + Healing Way priority
 -- Rules:
 --   • Do nothing if nobody is injured (<100%).
 --   • Self is TOP PRIORITY only if self < 50% HP.
@@ -7,6 +7,8 @@
 --   • AoE: If 3+ allies are <85% HP ⇒ Chain Heal.
 --   • Fever Dream buff ⇒ prefer Chain Heal (even if fewer than 3 injured).
 --   • Emergency: If any ally < 50% and Ancestral Swiftness is ready ⇒ cast AS, and only if you gain the AS buff, immediately cast Healing Wave on that ally.
+--   • LOS failures → 0.2s blacklist by name with a chat notice.
+--   • Healing Way buff on a unit gives them a 5% HP priority buffer (treated as 5% lower HP).
 --   • /aroka uses downrank; /arokamax forces max rank.
 
 local BOOKTYPE_SPELL = "spell"
@@ -14,18 +16,6 @@ local BOOKTYPE_SPELL = "spell"
 -- ===== Small Lua 5.0 helpers =====
 local function tlen(t) return table.getn(t) end
 local function tinsert(t, v) table.insert(t, v) end
-
--- ===== Scan list =====
-local function Aroka_BuildScanList()
-    local units = { "player", "target" }
-    if GetNumRaidMembers and GetNumRaidMembers() > 0 then
-        for i = 1, 40 do tinsert(units, "raid"..i) end
-    elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
-        for i = 1, 4 do tinsert(units, "party"..i) end
-        for i = 1, 4 do tinsert(units, "party"..i.."target") end
-    end
-    return units
-end
 
 -- ===== Unit name helper & LOS blacklist =====
 local function UnitNameSafe(unit)
@@ -48,6 +38,18 @@ local function Aroka_IsBlacklisted(unit)
         Aroka_Blacklist[name] = nil
     end
     return false
+end
+
+-- ===== Scan list =====
+local function Aroka_BuildScanList()
+    local units = { "player", "target" }
+    if GetNumRaidMembers and GetNumRaidMembers() > 0 then
+        for i = 1, 40 do tinsert(units, "raid"..i) end
+    elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
+        for i = 1, 4 do tinsert(units, "party"..i) end
+        for i = 1, 4 do tinsert(units, "party"..i.."target") end
+    end
+    return units
 end
 
 -- ===== Simple buff partial match =====
@@ -93,6 +95,8 @@ local function Aroka_SafeCastOnUnitByName(spellNameWithOptionalRank, unit)
         had = true
         hostile = (UnitCanAttack("player", "target") == 1)
     end
+
+    -- Remember last attempted target for LOS handling
     Aroka_LastCastTargetName = UnitNameSafe(unit)
 
     -- Clear any pending target cursor
@@ -161,7 +165,7 @@ local function Aroka_PickRank(spellName, unit)
     return best
 end
 
--- ===== Buff flag =====
+-- ===== Buff flags =====
 local function HasFeverDream() return HasBuff("player", "Fever Dream") end
 
 -- ===== Group health helpers =====
@@ -219,18 +223,22 @@ local function Aroka_CountInjured(thresholdFrac)
     return c
 end
 
--- ===== Emergency target: lowest ally below threshold (not self) =====
+-- ===== Emergency target: lowest ally below threshold (not self), with Healing Way buffer =====
 local function Aroka_FindCriticalTarget(thresholdFrac)
     local units = Aroka_BuildScanList()
     local bestU, bestFrac
     for i=1,tlen(units) do
         local u = units[i]
-        if u ~= "player" and UnitIsFriend("player", u) and Aroka_IsInRange("Healing Wave", u) then
+        if u ~= "player" and UnitIsFriend("player", u) and Aroka_IsInRange("Healing Wave", u) and (not Aroka_IsBlacklisted(u)) then
             local hp, mhp = UnitHealth(u), UnitHealthMax(u)
             if mhp and mhp > 0 and hp then
                 local f = hp / mhp
-                if f < thresholdFrac then
-                    if not bestFrac or f < bestFrac then bestFrac, bestU = f, u end
+                local fAdj = f
+                if HasBuff(u, "Healing Way") then
+                    fAdj = fAdj - 0.05; if fAdj < 0 then fAdj = 0 end
+                end
+                if fAdj < thresholdFrac then
+                    if not bestFrac or fAdj < bestFrac then bestFrac, bestU = fAdj, u end
                 end
             end
         end
@@ -251,7 +259,7 @@ local function Aroka_GetBestTarget(spellName)
         return "player"
     end
 
-    -- Otherwise pick lowest non-self in range
+    -- Otherwise pick lowest non-self in range (Healing Way gets a 5% priority buffer)
     local bestU, bestFrac
     for i=1,tlen(units) do
         local u = units[i]
@@ -259,7 +267,11 @@ local function Aroka_GetBestTarget(spellName)
             local hp, mhp = UnitHealth(u), UnitHealthMax(u)
             if mhp and mhp > 0 and hp and hp < mhp then
                 local f = hp / mhp
-                if not bestFrac or f < bestFrac then bestFrac, bestU = f, u end
+                local fAdj = f
+                if HasBuff(u, "Healing Way") then
+                    fAdj = fAdj - 0.05; if fAdj < 0 then fAdj = 0 end
+                end
+                if not bestFrac or fAdj < bestFrac then bestFrac, bestU = fAdj, u end
             end
         end
     end
@@ -368,7 +380,7 @@ frame:SetScript("OnEvent", function()
     end
 end)
 
--- LOS blacklist listener
+-- LOS blacklist listener (Vanilla uses arg1 globals)
 local aroka_errf = CreateFrame("Frame")
 aroka_errf:RegisterEvent("UI_ERROR_MESSAGE")
 aroka_errf:SetScript("OnEvent", function()
@@ -385,3 +397,4 @@ aroka_errf:SetScript("OnEvent", function()
         end
     end
 end)
+
