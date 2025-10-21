@@ -14,141 +14,104 @@ local function tinsert(t, v) table.insert(t, v) end
 -- plain-find helper (no regex surprises on 5.0)
 local function _plain_find(hay, needle)
     if not hay or not needle then return false end
-    local esc = string.gsub(needle, "([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
-    return string.find(string.lower(hay), string.lower(esc)) ~= nil
+    local s, _ = string.find(string.lower(hay), string.lower(needle), 1, true)
+    return s ~= nil
 end
 
--- name & blacklist
+-- safe UnitName
 local function UnitNameSafe(unit)
+    if not unit then return nil end
     local n = UnitName(unit)
-    if n then return n end
-    return tostring(unit or "?")
+    if n and n ~= "" then return n end
+    return nil
 end
 
-local Aroka_Blacklist = {}      -- [name] = expireTime
-local Aroka_LastCastTargetName = nil
-local Aroka_CastBufferUntil = 0
-local function Aroka_SetCastBuffer(sec)
+-- percentage HP (0..100) fallbacks
+local function UnitHealthPct(unit)
+    local mh = UnitHealthMax(unit) or 0
+    if mh <= 0 then return 100 end
+    local ch = UnitHealth(unit) or mh
+    local pct = math.floor((ch * 100) / mh)
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+    return pct
+end
+
+-- Cast throttle (affects all spells except Ancestral Swiftness)
+local AROKA_CAST_THROTTLE = 1.3
+local Aroka_NextCastAt = 0
+local function Aroka_CanCastNow(spellName)
+    if spellName and string.find(spellName, "Ancestral Swiftness", 1, true) then return true end
     local now = GetTime and GetTime() or 0
-    Aroka_CastBufferUntil = now + (sec or 1.3)
+    return now >= (Aroka_NextCastAt or 0)
 end
-
-local function Aroka_IsBlacklisted(unit)
-    local name = UnitNameSafe(unit)
+local function Aroka_ArmCastThrottle(spellName)
+    if spellName and string.find(spellName, "Ancestral Swiftness", 1, true) then return end
     local now = GetTime and GetTime() or 0
-    local exp = Aroka_Blacklist[name]
-    if exp and now < exp then
-        return true
-    end
-    if exp and now >= exp then
-        Aroka_Blacklist[name] = nil
-    end
-    return false
-end
-
--- Alive helper: ignore dead/ghost units when scanning
-local function Aroka_IsAlive(unit)
-    if not UnitExists or not UnitExists(unit) then return false end
-    if UnitIsDead and UnitIsDead(unit) then return false end
-    if UnitIsGhost and UnitIsGhost(unit) then return false end
-    local mhp = UnitHealthMax(unit)
-    return mhp and mhp > 0
+    Aroka_NextCastAt = now + AROKA_CAST_THROTTLE
 end
 
 ------------------------------------------------------------
--- Scan list (NO current target or partyXtarget bias)
+-- LOS + range temporary blacklist keyed by *player name* (intended target)
 ------------------------------------------------------------
-local function Aroka_BuildScanList()
-    local units = { "player" }
-    if GetNumRaidMembers and GetNumRaidMembers() > 0 then
-        for i = 1, 40 do tinsert(units, "raid"..i) end
-    elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
-        for i = 1, 4 do tinsert(units, "party"..i) end
-    end
-    return units
-end
+local Aroka_Blacklist = {}
 
-------------------------------------------------------------
--- Buff detection (tooltip scan)
--- Primary: GameTooltip:SetUnitBuff/SetUnitDebuff (if available)
--- Fallback (player only): GetPlayerBuff + GameTooltip:SetPlayerBuff
-------------------------------------------------------------
-local function HasBuff(unit, buffName)
-    if GameTooltip and GameTooltip.SetUnitBuff then
-        for i = 1, 40 do
-            GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-            GameTooltip:ClearLines()
-            GameTooltip:SetUnitBuff(unit, i)
-            local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
-            if text and _plain_find(text, buffName) then return true end
-        end
-        for i = 1, 40 do
-            GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-            GameTooltip:ClearLines()
-            GameTooltip:SetUnitDebuff(unit, i)
-            local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
-            if text and _plain_find(text, buffName) then return true end
-        end
-        return false
-    end
-    -- Vanilla-style player fallback
-    if unit == "player" and GetPlayerBuff and GameTooltip and GameTooltip.SetPlayerBuff then
-        for i = 0, 31 do
-            local idx = GetPlayerBuff(i, "HELPFUL")
-            if idx and idx >= 0 then
-                GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-                GameTooltip:ClearLines()
-                GameTooltip:SetPlayerBuff(idx)
-                local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
-                if text and _plain_find(text, buffName) then return true end
-            end
-        end
-        for i = 0, 15 do
-            local idx = GetPlayerBuff(i, "HARMFUL")
-            if idx and idx >= 0 then
-                GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-                GameTooltip:ClearLines()
-                GameTooltip:SetPlayerBuff(idx)
-                local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
-                if text and _plain_find(text, buffName) then return true end
-            end
-        end
-    end
+local function Aroka_IsBlacklisted(name)
+    local until_t = Aroka_Blacklist[name]
+    if not until_t then return false end
+    local now = GetTime and GetTime() or 0
+    if now < until_t then return true end
+    Aroka_Blacklist[name] = nil
     return false
 end
 
 ------------------------------------------------------------
--- Range & cooldown helpers
+-- Range detection – pfUI aware, then spell APIs
 ------------------------------------------------------------
--- Prefer pfUI's range state when available; fallback to spell range API
+-- Defensive extractor for pfUI unit from a frame (handles pfUI variants safely)
+local function _pfui_frame_unit(fr)
+    -- pfUI frames vary: sometimes .unit / .unitstr; some builds put a *string* in .label,
+    -- and others use .label as a subtable with .unit in it. Guard all shapes.
+    if type(fr) ~= "table" then return nil end
+
+    if type(fr.unit) == "string" then return fr.unit end
+    if type(fr.unitstr) == "string" then return fr.unitstr end
+
+    local lbl = rawget(fr, "label")
+    if type(lbl) == "string" then
+        -- Some pfUI forks set frame.label = "raid12" etc.
+        return lbl
+    elseif type(lbl) == "table" and type(lbl.unit) == "string" then
+        return lbl.unit
+    end
+
+    return nil
+end
+
 local function Aroka_pfUI_IsInRange(unit)
     if not pfUI then return nil end
-    -- 1) pfUI API, if exposed
     if pfUI.api and pfUI.api.UnitInRange then
-        local ok, val = pcall(pfUI.api.UnitInRange, unit)
-        if ok and val ~= nil then
-            if val == true or val == 1 then return true end
-            if val == false or val == 0 then return false end
-        end
+        local ok = pfUI.api.UnitInRange(unit)
+        if ok ~= nil then return ok and true or false end
     end
-    -- 2) Infer from unitframe alpha if we can find the frame
-    if not pfUI.uf then return nil end
+    -- Heuristic via frame alpha if UnitInRange isn’t available
     local containers = {}
     if string.sub(unit,1,4) == "raid" then
-        if pfUI.uf.raid then table.insert(containers, pfUI.uf.raid) end
+        if pfUI.uf and pfUI.uf.raid then table.insert(containers, pfUI.uf.raid) end
     elseif string.sub(unit,1,5) == "party" then
-        if pfUI.uf.group then table.insert(containers, pfUI.uf.group) end
+        if pfUI.uf and pfUI.uf.group then table.insert(containers, pfUI.uf.group) end
     elseif unit == "player" then
-        if pfUI.uf.player then table.insert(containers, { pfUI.uf.player }) end
+        if pfUI.uf and pfUI.uf.player then table.insert(containers, { pfUI.uf.player }) end
     end
     for _, cont in pairs(containers) do
         if type(cont) == "table" then
             for _, fr in pairs(cont) do
-                local u = fr and (fr.unit or (fr.label and fr.label.unit) or fr.unitstr)
-                if u == unit and fr.GetAlpha then
+                local u = _pfui_frame_unit(fr)
+                if u == unit and type(fr) == "table" and fr.GetAlpha then
                     local a = fr:GetAlpha()
                     if a ~= nil then
-                        return a >= 0.8 -- treat dimmed (<0.8) as out-of-range
+                        -- pfUI makes out-of-range frames semi-transparent (~0.5)
+                        return (a > 0.75)
                     end
                 end
             end
@@ -157,72 +120,61 @@ local function Aroka_pfUI_IsInRange(unit)
     return nil
 end
 
-local function Aroka_IsInRange(spellName, unit)
+local function IsUnitInRange(unit)
     -- Try pfUI first
     local p = Aroka_pfUI_IsInRange(unit)
     if p ~= nil then return p end
-    -- Fallback to spell range APIs
-    if not IsSpellInRange then return true end
-    local r = IsSpellInRange(spellName, unit)
-    if r == 1 then return true end
-    if r == 0 then return false end
-    if CheckInteractDistance and CheckInteractDistance(unit, 4) then return true end
-    return true
-end
 
-local function IsSpellReady(spellName)
-    for i = 1, 300 do
-        local name = GetSpellName(i, BOOKTYPE_SPELL)
-        if not name then break end
-        if name == spellName then
-            local start, dur = GetSpellCooldown(i, BOOKTYPE_SPELL)
-            if (not start) or dur == 0 or start == 0 then return true end
-            local now = GetTime and GetTime() or 0
-            return now >= (start + dur)
-        end
+    -- Fall back to spell range checks (these APIs exist in 1.12)
+    -- Use small heals to probe range subtly
+    if SpellIsTargeting and SpellStopTargeting then
+        if SpellIsTargeting() then SpellStopTargeting() end
+    end
+    local spells = { "Lesser Healing Wave", "Healing Wave", "Chain Heal" }
+    for i = 1, table.getn(spells) do
+        local s = spells[i]
+        local inRange = IsSpellInRange(s, unit)
+        if inRange == 1 then return true end
     end
     return false
 end
 
 ------------------------------------------------------------
--- Safe cast on intended unit with target restore
+-- Pure cast-through helper (never retargets): Cast → SpellTargetUnit → clear stuck cursor
 ------------------------------------------------------------
-local function Aroka_SafeCastOnUnitByName(spellNameWithOptionalRank, unit)
-    local hadTarget = UnitExists and (UnitExists("target") == 1) or false
-    local needTempTarget = true
-    if hadTarget and (UnitNameSafe("target") == UnitNameSafe(unit)) then
-        needTempTarget = false
-    end
-
+local Aroka_LastCastTargetName = nil
+local function Aroka_CastThrough(unit, spellNameWithOptionalRank)
+    -- Remember last intended target for error blacklisting
     Aroka_LastCastTargetName = UnitNameSafe(unit)
 
+    -- If cursor is stuck from a previous action, clear it
     if SpellIsTargeting and SpellIsTargeting() then SpellStopTargeting() end
 
-    if needTempTarget and TargetUnit then
-        TargetUnit(unit)
-    end
-
+    -- Start the cast (this may raise the targeting cursor if current target isn't appropriate)
     CastSpellByName(spellNameWithOptionalRank)
+
+    -- Feed the intended unit to the spell cursor without changing target
     if SpellIsTargeting and SpellIsTargeting() then
         SpellTargetUnit(unit)
+        -- If still targeting, cancel to avoid contaminating next click
+        if SpellIsTargeting and SpellIsTargeting() then SpellStopTargeting() end
     end
+    return true
+end
 
-    -- Throttle new casts a bit (UI + latency headroom)
-    Aroka_SetCastBuffer(1.3)
-
-    if needTempTarget then
-        if hadTarget and TargetLastTarget then
-            TargetLastTarget()
-        elseif ClearTarget then
-            ClearTarget()
-        end
-    end
+--------------------------------------------------------
+local function Aroka_SafeCastOnUnitByName(spellNameWithOptionalRank, unit)
+    -- Throttle all casts except Ancestral Swiftness
+    if not Aroka_CanCastNow(spellNameWithOptionalRank) then return false end
+    local ok = Aroka_CastThrough(unit, spellNameWithOptionalRank)
+    Aroka_ArmCastThrottle(spellNameWithOptionalRank)
+    return ok
 end
 
 ------------------------------------------------------------
 -- Ranks / base values / downrank picker
 ------------------------------------------------------------
-local function Aroka_GetKnownRanks(spellName) -- ascending {1,2,...}
+local function Aroka_GetKnownRanks(spellName)
     local ranks = {}
     for i = 1, 300 do
         local name, rank = GetSpellName(i, BOOKTYPE_SPELL)
@@ -236,255 +188,258 @@ local function Aroka_GetKnownRanks(spellName) -- ascending {1,2,...}
     return ranks
 end
 
-local LHW_BASE = { [1]=174, [2]=264, [3]=359, [4]=486, [5]=668, [6]=880 }
-local HW_BASE  = { [1]=39,  [2]=71,  [3]=142, [4]=292, [5]=408, [6]=579, [7]=797, [8]=1092, [9]=1464, [10]=1735 }
-local CH_BASE  = { [1]=356, [2]=449, [3]=607 }
-
-local function Aroka_EffectiveBase(spellName, rank)
-    local base
-    if spellName == "Lesser Healing Wave" then base = LHW_BASE[rank]
-    elseif spellName == "Healing Wave" then base = HW_BASE[rank]
-    elseif spellName == "Chain Heal" then base = CH_BASE[rank] end
-    if not base then return nil end
-
-    local bonus = 0
-    if BonusScanner and BonusScanner.GetBonus then
-        local b = BonusScanner:GetBonus("HEAL")
-        if b and tonumber(b) then bonus = bonus + tonumber(b) end
-    end
-
-    local coeff = 0.43 -- LHW
-    if spellName == "Healing Wave" then coeff = 0.86 end
-    if spellName == "Chain Heal" then coeff = 0.71 end
-    return base + (bonus * coeff)
-end
+local BASE_HEAL = {
+    ["Healing Wave"] = {
+        [1]=34,[2]=64,[3]=129,[4]=268,[5]=376,[6]=506,[7]=678,[8]=879,[9]=1115,[10]=1367,[11]=1620,[12]=1900
+    },
+    ["Lesser Healing Wave"] = {
+        [1]=53,[2]=78,[3]=112,[4]=151,[5]=204,[6]=274,[7]=364
+    },
+    ["Chain Heal"] = {
+        [1]=320,[2]=405,[3]=551
+    },
+}
 
 local function Aroka_PickRank(spellName, unit)
-    local hp, mhp = UnitHealth(unit), UnitHealthMax(unit)
-    if not mhp or mhp <= 0 or not hp then return nil end
-    local missing = mhp - hp
-
+    local hp = UnitHealthPct(unit)
     local ranks = Aroka_GetKnownRanks(spellName)
-    if tlen(ranks) == 0 then return nil end
+    if tlen(ranks) == 0 then return spellName end -- no rank info → cast base
 
-    local best = ranks[tlen(ranks)] -- default to max
-    for i = 1, tlen(ranks) do
-        local r = ranks[i]
-        local eff = Aroka_EffectiveBase(spellName, r)
-        if eff and eff >= missing then best = r; break end
+    local base = BASE_HEAL[spellName] or {}
+
+    -- Simple %HP → rank curve. Tweak to taste.
+    local n = tlen(ranks)
+    local idx
+    if hp <= 25 then
+        idx = n
+    elseif hp <= 40 then
+        idx = math.max(1, n - 1)
+    elseif hp <= 60 then
+        idx = math.max(1, n - 2)
+    elseif hp <= 80 then
+        idx = math.max(1, n - 3)
+    else
+        idx = math.max(1, n - 4)
     end
+
+    local pick = ranks[idx] or ranks[1]
+    return string.format("%s(Rank %d)", spellName, pick)
+end
+
+------------------------------------------------------------
+-- Buff checking (Ancestral Swiftness / Fever Dream / Healing Way bias)
+------------------------------------------------------------
+
+-- tooltip scan for *name substring* on arbitrary unit (Vanilla: GameTooltip:SetUnitBuff only in 2.0+)
+local function UnitHasBuffByNameSub(unit, nameSubstr)
+    -- Best effort for non-player units (1.12 lacks SetUnitBuff)
+    if unit ~= "player" then
+        -- try Luna / pfUI / other tooltip backdoors (rare on 1.12); if not available, fall back to player-only
+        -- As a safe default, we won’t crash – just return false for non-player if APIs aren’t present
+        if GameTooltip and GameTooltip.SetUnitBuff then
+            GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+            GameTooltip:ClearLines()
+            GameTooltip:SetUnitBuff(unit, 1) -- probe to attach tooltip to unit; not reliable on 1.12
+            local t = getglobal("GameTooltipTextLeft1")
+            local label = t and t:GetText()
+            if label and _plain_find(label, nameSubstr) then return true end
+        end
+    else
+        -- Player path (Vanilla friendly): iterate GetPlayerBuff indices
+        if GetPlayerBuff and GameTooltip and GameTooltip.SetPlayerBuff then
+            for idx = 0, 31 do
+                if idx < 0 then break end
+                GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+                GameTooltip:ClearLines()
+                GameTooltip:SetPlayerBuff(idx)
+                local t = getglobal("GameTooltipTextLeft1")
+                local label = t and t:GetText()
+                if label and _plain_find(label, nameSubstr) then return true end
+            end
+        end
+    end
+
+    return false
+end
+
+local function HasBuff(unit, name)
+    -- Fast path for exact name on player using GetPlayerBuffName if available
+    if unit == "player" and GetPlayerBuff and GetPlayerBuffName then
+        for i = 0, 31 do
+            local b = GetPlayerBuff(i, "HELPFUL|HARMFUL")
+            if b and b ~= -1 then
+                local bn = GetPlayerBuffName(b)
+                if bn and _plain_find(bn, name) then return true end
+            end
+        end
+    end
+    -- Fallback: tooltip substring scan
+    return UnitHasBuffByNameSub(unit, name)
+end
+
+------------------------------------------------------------
+-- Target scan & prioritization
+------------------------------------------------------------
+
+local function IsHealable(unit)
+    if not UnitExists(unit) then return false end
+    if UnitIsDeadOrGhost(unit) then return false end
+    if not UnitIsFriend("player", unit) then return false end
+    return true
+end
+
+local function Aroka_FindBestHealTarget()
+    local units = {}
+    -- Fill units list with player, party, then raid in 1..40 order
+    tinsert(units, "player")
+    for i = 1, 4 do tinsert(units, "party"..i) end
+    for i = 1, 40 do tinsert(units, "raid"..i) end
+
+    local best, bestScore = nil, 101       -- score = realPct with Healing Way bias
+    local minRealPct = 101                 -- actual (unbiased) lowest health in the raid
+
+    for _, u in pairs(units) do
+        if IsHealable(u) then
+            local name = UnitNameSafe(u)
+            if name and not Aroka_IsBlacklisted(name) then
+                local realPct = UnitHealthPct(u)
+                if realPct < minRealPct then minRealPct = realPct end
+
+                local score = realPct
+                if HasBuff(u, "Healing Way") then score = score - 5 end -- bias for tie‑breaking only
+
+                if score < bestScore then best, bestScore = u, score end
+            end
+        end
+    end
+
+    -- If the *actual* health of everyone is 100%, do nothing
+    if minRealPct >= 100 then return nil end
+
     return best
 end
 
+local function Aroka_CountBelow(threshold)
+    local c = 0
+    for i = 1, 40 do if IsHealable("raid"..i) and UnitHealthPct("raid"..i) < threshold then c = c + 1 end end
+    for i = 1, 4 do if IsHealable("party"..i) and UnitHealthPct("party"..i) < threshold then c = c + 1 end end
+    if IsHealable("player") and UnitHealthPct("player") < threshold then c = c + 1 end
+    return c
+end
+
 ------------------------------------------------------------
--- Group health helpers / selection
+-- Main runner
 ------------------------------------------------------------
-local function Aroka_AnyoneInjured()
-    local units = Aroka_BuildScanList()
-    for i = 1, tlen(units) do
-        local u = units[i]
-        if Aroka_IsAlive(u) and UnitIsFriend("player", u) then
-            local hp, mhp = UnitHealth(u), UnitHealthMax(u)
-            if hp and mhp and hp < mhp then return true end
+local function Aroka_Run(useMax)
+    local target = Aroka_FindBestHealTarget()
+    if not target then return end
+
+    local targetPct = UnitHealthPct(target)
+    local fever   = HasBuff("player", "Fever Dream")
+    local aswift  = HasBuff("player", "Ancestral Swiftness")
+
+    -- EMERGENCY: if our chosen heal target is <=50% HP, pop Ancestral Swiftness first (if ready & not up),
+    -- then use Healing Wave. This mirrors the intended behavior without touching your current target.
+    if targetPct <= 50 then
+        -- Emergency rule: only cast Healing Wave if AS is active or Fever Dream is up.
+        -- Otherwise, prefer LHW. If AS is ready and not active, pop it first and return.
+        if (not aswift) and IsSpellReadyByName("Ancestral Swiftness") then
+            CastSpellByName("Ancestral Swiftness")
+            return
+        end
+
+        local spell
+        if aswift or fever then
+            if not useMax then
+                spell = Aroka_PickRank("Healing Wave", target)
+            else
+                spell = "Healing Wave"
+            end
+        else
+            if not useMax then
+                spell = Aroka_PickRank("Lesser Healing Wave", target)
+            else
+                spell = "Lesser Healing Wave"
+            end
+        end
+
+        local inRange = IsUnitInRange(target)
+        if inRange == false then
+            local n = UnitNameSafe(target)
+            if n then Aroka_Blacklist[n] = (GetTime() or 0) + 5.0 end
+            if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("qh aroka: "..(n or "target").." out of range — 5s blacklist", 1, 0.5, 0) end
+            return
+        end
+        Aroka_SafeCastOnUnitByName(spell, target)
+        return
+    end
+
+    -- Normal priority
+    local spell
+    if Aroka_CountBelow(85) >= 3 then
+        spell = "Chain Heal"
+    elseif fever then
+        spell = "Healing Wave"
+    else
+        spell = "Lesser Healing Wave"
+    end
+
+    if not useMax then
+        spell = Aroka_PickRank(spell, target)
+    end
+
+    -- If AS is active, always prefer Healing Wave regardless of the above
+    if aswift then
+        if not useMax then
+            spell = Aroka_PickRank("Healing Wave", target)
+        else
+            spell = "Healing Wave"
+        end
+    end
+
+    -- Range protection: blacklist and bail if not in range
+    local inRange = IsUnitInRange(target)
+    if inRange == false then
+        local n = UnitNameSafe(target)
+        if n then Aroka_Blacklist[n] = (GetTime() or 0) + 5.0 end
+        if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("qh aroka: "..(n or "target").." out of range — 5s blacklist", 1, 0.5, 0) end
+        return
+    end
+
+    Aroka_SafeCastOnUnitByName(spell, target)
+end
+
+------------------------------------------------------------
+-- Castable? (coarse)
+------------------------------------------------------------
+function IsSpellReadyByName(spellName)
+    for i = 1, 300 do
+        local name, rank = GetSpellName(i, BOOKTYPE_SPELL)
+        if not name then break end
+        if name == spellName then
+            local start, duration = GetSpellCooldown(i, BOOKTYPE_SPELL)
+            if not start or start == 0 or (duration and duration == 0) then return true end
+            if start and duration then
+                local now = GetTime and GetTime() or 0
+                if now >= (start + duration) then return true end
+            end
+            return false
         end
     end
     return false
 end
 
-local function Aroka_AllOthersFullHP()
-    local units = Aroka_BuildScanList()
-    for i = 1, tlen(units) do
-        local u = units[i]
-        if u ~= "player" and Aroka_IsAlive(u) and UnitIsFriend("player", u) then
-            local hp, mhp = UnitHealth(u), UnitHealthMax(u)
-            if hp and mhp and (hp < mhp) then return false end
-        end
-    end
-    return true
-end
-
-local function Aroka_CountInjured(thresholdFrac)
-    local units = Aroka_BuildScanList()
-    local c = 0
-    for i = 1, tlen(units) do
-        local u = units[i]
-        if Aroka_IsAlive(u) and UnitIsFriend("player", u) then
-            local hp, mhp = UnitHealth(u), UnitHealthMax(u)
-            if hp and mhp then
-                local f = hp / mhp
-                if f < thresholdFrac then c = c + 1 end
-            end
-        end
-    end
-    return c
-end
-
-local function Aroka_FindCriticalTarget(thresholdFrac)
-    local units = Aroka_BuildScanList()
-    local bestU, bestFrac
-    for i = 1, tlen(units) do
-        local u = units[i]
-        if u ~= "player" and Aroka_IsAlive(u) and UnitIsFriend("player", u) and Aroka_IsInRange("Healing Wave", u) and (not Aroka_IsBlacklisted(u)) then
-            local hp, mhp = UnitHealth(u), UnitHealthMax(u)
-            if mhp and mhp > 0 and hp then
-                local f = hp / mhp
-                local fAdj = f
-                if HasBuff(u, "Healing Way") then fAdj = fAdj - 0.05; if fAdj < 0 then fAdj = 0 end end
-                if fAdj < thresholdFrac then
-                    if not bestFrac or fAdj < bestFrac then bestFrac, bestU = fAdj, u end
-                end
-            end
-        end
-    end
-    return bestU, bestFrac
-end
-
-local function Aroka_GetBestTarget(spellName)
-    if not Aroka_AnyoneInjured() then return nil end
-
-    local units = Aroka_BuildScanList()
-    local playerHP, playerMax = UnitHealth("player") or 0, UnitHealthMax("player") or 0
-    local playerFrac = (playerMax > 0) and (playerHP / playerMax) or 1
-
-    -- Self under 50% → absolute priority (only if alive)
-    if Aroka_IsAlive("player") and playerFrac < 0.50 and Aroka_IsInRange(spellName, "player") and playerHP < playerMax then
-        return "player"
-    end
-
-    -- Lowest non-self, with Healing Way 5% buffer, ignoring blacklisted/OORange/dead
-    local bestU, bestFrac
-    for i = 1, tlen(units) do
-        local u = units[i]
-        if u ~= "player" and Aroka_IsAlive(u) and (not Aroka_IsBlacklisted(u)) and Aroka_IsInRange(spellName, u) and UnitIsFriend("player", u) then
-            local hp, mhp = UnitHealth(u), UnitHealthMax(u)
-            if mhp and mhp > 0 and hp and hp < mhp then
-                local f = hp / mhp
-                local fAdj = f
-                if HasBuff(u, "Healing Way") then fAdj = fAdj - 0.05; if fAdj < 0 then fAdj = 0 end end
-                if not bestFrac or fAdj < bestFrac then bestFrac, bestU = fAdj, u end
-            end
-        end
-    end
-    if bestU then return bestU end
-
-    -- If no one else needs healing, allow self-heal only when all others are 100% and self ≥ 50%
-    if Aroka_AllOthersFullHP() and playerFrac >= 0.50 and Aroka_IsAlive("player") then
-        if (playerMax > 0) and (playerHP < playerMax) and Aroka_IsInRange(spellName, "player") then
-            return "player"
-        end
-    end
-
-    return nil
-end
-
 ------------------------------------------------------------
--- Core decision
+-- Load prints
 ------------------------------------------------------------
-local function HasFeverDream() return HasBuff("player", "Fever Dream") end
-
-local function Aroka_Run(forceMax)
-    local now = GetTime and GetTime() or 0
-    if now < (Aroka_CastBufferUntil or 0) then return end
-    if not Aroka_AnyoneInjured() then return end
-
-    -- If Ancestral Swiftness buff is currently on the player, force exactly one Healing Wave
-    if HasBuff("player", "Ancestral Swiftness") then
-        local u = Aroka_GetBestTarget("Healing Wave")
-        if u then
-            if forceMax then
-                Aroka_SafeCastOnUnitByName("Healing Wave", u)
-            else
-                local r = Aroka_PickRank("Healing Wave", u)
-                if r then Aroka_SafeCastOnUnitByName(string.format("%s(Rank %d)", "Healing Wave", r), u)
-                else Aroka_SafeCastOnUnitByName("Healing Wave", u) end
-            end
-        end
-        return
-    end
-
-    -- Emergency: Ancestral Swiftness + Healing Wave on ally <50%
-    local u_crit = Aroka_FindCriticalTarget(0.50)
-    if u_crit and IsSpellReady("Ancestral Swiftness") then
-        CastSpellByName("Ancestral Swiftness")
-        if HasBuff("player", "Ancestral Swiftness") then
-            Aroka_SafeCastOnUnitByName("Healing Wave", u_crit)
-            return
-        end
-        -- If buff didn't land, fall through
-    end
-
-    -- Raid-wide: 3+ allies <85% → Chain Heal
-    local injured = Aroka_CountInjured(0.85)
-    if injured >= 3 and IsSpellReady("Chain Heal") then
-        local u = Aroka_GetBestTarget("Chain Heal")
-        if u then
-            if forceMax then
-                Aroka_SafeCastOnUnitByName("Chain Heal", u)
-            else
-                local r = Aroka_PickRank("Chain Heal", u)
-                if r then Aroka_SafeCastOnUnitByName(string.format("%s(Rank %d)", "Chain Heal", r), u)
-                else Aroka_SafeCastOnUnitByName("Chain Heal", u) end
-            end
-            return
-        end
-    end
-
-    -- Fever Dream → prefer Chain Heal
-    if HasFeverDream() and IsSpellReady("Chain Heal") then
-        local u = Aroka_GetBestTarget("Chain Heal")
-        if u then
-            if forceMax then
-                Aroka_SafeCastOnUnitByName("Chain Heal", u)
-            else
-                local r = Aroka_PickRank("Chain Heal", u)
-                if r then Aroka_SafeCastOnUnitByName(string.format("%s(Rank %d)", "Chain Heal", r), u)
-                else Aroka_SafeCastOnUnitByName("Chain Heal", u) end
-            end
-            return
-        end
-    end
-
-    -- Fallback → Lesser Healing Wave
-    if IsSpellReady("Lesser Healing Wave") then
-        local u = Aroka_GetBestTarget("Lesser Healing Wave")
-        if u then
-            if forceMax then
-                Aroka_SafeCastOnUnitByName("Lesser Healing Wave", u)
-            else
-                local r = Aroka_PickRank("Lesser Healing Wave", u)
-                if r then Aroka_SafeCastOnUnitByName(string.format("%s(Rank %d)", "Lesser Healing Wave", r), u)
-                else Aroka_SafeCastOnUnitByName("Lesser Healing Wave", u) end
-            end
-        end
-    end
-end
-
-------------------------------------------------------------
--- Slash commands / login wiring
-------------------------------------------------------------
-SLASH_AROKA1 = "/aroka"
-SlashCmdList["AROKA"] = function(msg) Aroka_Run(false) end
-
-SLASH_AROKAMAX1 = "/arokamax"
-SlashCmdList["AROKAMAX"] = function(msg) Aroka_Run(true) end
-
-SLASH_AROKAPING1 = "/arokaping"
-SlashCmdList["AROKAPING"] = function(msg)
-    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka: OK", 0, 1, 0) end
-end
-
-local _loginf = CreateFrame("Frame")
-_loginf:RegisterEvent("PLAYER_LOGIN")
-_loginf:SetScript("OnEvent", function()
-    SLASH_AROKA1 = "/aroka";      SlashCmdList["AROKA"] = function(msg) Aroka_Run(false) end
-    SLASH_AROKAMAX1 = "/arokamax"; SlashCmdList["AROKAMAX"] = function(msg) Aroka_Run(true) end
-    SLASH_AROKAPING1 = "/arokaping"; SlashCmdList["AROKAPING"] = function(msg)
-        if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka: OK (login)", 0, 1, 0) end
-    end
+local aroka_loadf = CreateFrame("Frame")
+aroka_loadf:RegisterEvent("ADDON_LOADED")
+aroka_loadf:SetScript("OnEvent", function()
+    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka loaded (Shaman) — /aroka, /arokamax", 0, 1, 0) end
 end)
 
 ------------------------------------------------------------
--- LOS blacklist listener (Vanilla globals arg1)
+-- Error listener → soft blacklist (Vanilla globals arg1)
 ------------------------------------------------------------
 local aroka_errf = CreateFrame("Frame")
 aroka_errf:RegisterEvent("UI_ERROR_MESSAGE")
@@ -492,13 +447,57 @@ aroka_errf:SetScript("OnEvent", function()
     local msg = arg1
     if not msg then return end
     local lower = string.lower(msg)
-    if string.find(lower, "line of sight") then
-        local name = Aroka_LastCastTargetName
+    local name = Aroka_LastCastTargetName
+
+    -- LoS → short blacklist
+    if string.find(lower, "line of sight") or string.find(lower, "line of site") or string.find(lower, "los") then
         if name then
             Aroka_Blacklist[name] = (GetTime() or 0) + 2.0
             if DEFAULT_CHAT_FRAME then
-                DEFAULT_CHAT_FRAME:AddMessage(string.format('qh aroka has blacklisted "%s" for 2.0 seconds', name), 1, 0.5, 0)
+                DEFAULT_CHAT_FRAME:AddMessage(string.format('qh aroka: blacklisted "%s" for 2.0s (LoS)', name), 1, 0.5, 0)
             end
         end
+        return
     end
+
+    -- Range → slightly longer blacklist
+    if string.find(lower, "out of range") or string.find(lower, "too far away") or string.find(lower, "range") then
+        if name then
+            Aroka_Blacklist[name] = (GetTime() or 0) + 5.0
+            if DEFAULT_CHAT_FRAME then
+                DEFAULT_CHAT_FRAME:AddMessage(string.format('qh aroka: blacklisted "%s" for 5.0s (range)', name), 1, 0.5, 0)
+            end
+        end
+        return
+    end
+
+    -- Generic failure → tiny cooldown to prevent thrashing
+    if string.find(lower, "another action") or string.find(lower, "can’t do that") or string.find(lower, "can't do that") then
+        if name then
+            Aroka_Blacklist[name] = (GetTime() or 0) + 0.7
+        end
+        return
+    end
+end)
+
+------------------------------------------------------------
+-- Slash commands
+------------------------------------------------------------
+if not SlashCmdList then SlashCmdList = {} end
+
+SLASH_QHAROKA1 = "/aroka"
+SlashCmdList["QHAROKA"] = function(msg) Aroka_Run(false) end
+
+SLASH_QHAROKAMAX1 = "/arokamax"
+SlashCmdList["QHAROKAMAX"] = function(msg) Aroka_Run(true) end
+
+SLASH_QHAROKAPING1 = "/arokaping"
+SlashCmdList["QHAROKAPING"] = function(msg)
+  if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka: OK (redundant)", 0, 1, 0) end
+end
+
+local aroka_loadf2 = CreateFrame("Frame")
+aroka_loadf2:RegisterEvent("VARIABLES_LOADED")
+aroka_loadf2:SetScript("OnEvent", function()
+    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka ready — type /aroka", 0.2, 1, 0.2) end
 end)
