@@ -38,7 +38,7 @@ local function UnitHealthPct(unit)
 end
 
 -- Cast throttle (affects all spells except Ancestral Swiftness)
-local AROKA_CAST_THROTTLE = 1.3
+local AROKA_CAST_THROTTLE = 0
 local Aroka_NextCastAt = 0
 local function Aroka_CanCastNow(spellName)
     if spellName and string.find(spellName, "Ancestral Swiftness", 1, true) then return true end
@@ -49,6 +49,20 @@ local function Aroka_ArmCastThrottle(spellName)
     if spellName and string.find(spellName, "Ancestral Swiftness", 1, true) then return end
     local now = GetTime and GetTime() or 0
     Aroka_NextCastAt = now + AROKA_CAST_THROTTLE
+end
+
+-- Scan throttle: limits how often the /aroka logic can run to reduce frame spikes
+local AROKA_SCAN_THROTTLE = 0.20  -- ~5 checks/sec; tweak 0.15–0.30 to taste
+local Aroka_NextScanAt = 0
+
+local function Aroka_CanScanNow()
+    local now = GetTime and GetTime() or 0
+    return now >= (Aroka_NextScanAt or 0)
+end
+
+local function Aroka_ArmScanThrottle()
+    local now = GetTime and GetTime() or 0
+    Aroka_NextScanAt = now + AROKA_SCAN_THROTTLE
 end
 
 ------------------------------------------------------------
@@ -164,12 +178,16 @@ end
 
 --------------------------------------------------------
 local function Aroka_SafeCastOnUnitByName(spellNameWithOptionalRank, unit)
-    -- Throttle all casts except Ancestral Swiftness
+    -- Respect the cast throttle (AS still bypasses via Aroka_CanCastNow)
     if not Aroka_CanCastNow(spellNameWithOptionalRank) then return false end
-    local ok = Aroka_CastThrough(unit, spellNameWithOptionalRank)
+
+    -- Arm the cast throttle at the START of the cast to front-load the delay
     Aroka_ArmCastThrottle(spellNameWithOptionalRank)
-    return ok
+
+    -- Now try to cast through; if it fails, we’ll relax the throttle via events below
+    return Aroka_CastThrough(unit, spellNameWithOptionalRank)
 end
+
 
 ------------------------------------------------------------
 -- Ranks / base values / downrank picker
@@ -277,6 +295,35 @@ local function HasBuff(unit, name)
     return UnitHasBuffByNameSub(unit, name)
 end
 
+-- === Fever Dream PROC-only detector (Turtle/1.12) ===
+-- We treat Fever Dream as active only if its remaining time is short (≤ 30s).
+local _fdTT = CreateFrame("GameTooltip", "QhArokaFDTT", UIParent, "GameTooltipTemplate")
+_fdTT:SetOwner(UIParent, "ANCHOR_NONE")
+
+local function _GetPlayerBuffName(buffIndex)
+  _fdTT:ClearLines()
+  _fdTT:SetPlayerBuff(buffIndex)
+  local fs = getglobal("QhArokaFDTTTextLeft1")
+  return fs and fs:GetText() or nil
+end
+
+local function HasFeverDreamProc()
+  for i = 0, 31 do
+    local b = GetPlayerBuff(i, "HELPFUL")
+    if b == -1 then break end -- no more buffs
+    if b and b >= 0 then
+      local name = _GetPlayerBuffName(b)
+      if name and string.find(name, "Fever Dream", 1, true) then
+        local tl = GetPlayerBuffTimeLeft(b) or 0
+        if tl > 0 and tl <= 30 then
+          return true  -- this is the timed blue-orb proc
+        end
+      end
+    end
+  end
+  return false
+end
+
 ------------------------------------------------------------
 -- Target scan & prioritization
 ------------------------------------------------------------
@@ -331,16 +378,21 @@ end
 -- Main runner
 ------------------------------------------------------------
 local function Aroka_Run(useMax)
+if not Aroka_CanScanNow() then return end
+    Aroka_ArmScanThrottle()
     local target = Aroka_FindBestHealTarget()
     if not target then return end
 
-    local targetPct = UnitHealthPct(target)
-    local fever   = HasBuff("player", "Fever Dream")
-    local aswift  = HasBuff("player", "Ancestral Swiftness")
+   local targetPct   = UnitHealthPct(target)
+local feverProc   = HasFeverDreamProc()
+local aswift      = HasBuff("player", "Ancestral Swiftness")
+local chainEligible = (Aroka_CountBelow(85) >= 3)
+
 
     -- EMERGENCY: if our chosen heal target is <=50% HP, pop Ancestral Swiftness first (if ready & not up),
     -- then use Healing Wave. This mirrors the intended behavior without touching your current target.
-    if targetPct <= 50 then
+    -- EMERGENCY only if CH is NOT eligible
+        if (not chainEligible) and (targetPct <= 50) then
         -- Emergency rule: only cast Healing Wave if AS is active or Fever Dream is up.
         -- Otherwise, prefer LHW. If AS is ready and not active, pop it first and return.
         if (not aswift) and IsSpellReadyByName("Ancestral Swiftness") then
@@ -349,7 +401,7 @@ local function Aroka_Run(useMax)
         end
 
         local spell
-        if aswift or fever then
+        if aswift or feverProc then
             if not useMax then
                 spell = Aroka_PickRank("Healing Wave", target)
             else
@@ -375,27 +427,28 @@ local function Aroka_Run(useMax)
     end
 
     -- Normal priority
-    local spell
-    if Aroka_CountBelow(85) >= 3 then
-        spell = "Chain Heal"
-    elseif fever then
-        spell = "Healing Wave"
-    else
-        spell = "Lesser Healing Wave"
-    end
+local spell
+if chainEligible then
+    spell = "Chain Heal"
+elseif feverProc then
+    spell = "Healing Wave"
+else
+    spell = "Lesser Healing Wave"
+end
 
     if not useMax then
         spell = Aroka_PickRank(spell, target)
     end
 
     -- If AS is active, always prefer Healing Wave regardless of the above
-    if aswift then
-        if not useMax then
-            spell = Aroka_PickRank("Healing Wave", target)
-        else
-            spell = "Healing Wave"
-        end
+   -- If AS is active, prefer Healing Wave, but never override Chain Heal
+if aswift and not string.find(spell, "Chain Heal", 1, true) then
+    if not useMax then
+        spell = Aroka_PickRank("Healing Wave", target)
+    else
+        spell = "Healing Wave"
     end
+end
 
     -- Range protection: blacklist and bail if not in range
     local inRange = IsUnitInRange(target)
@@ -477,6 +530,18 @@ aroka_errf:SetScript("OnEvent", function()
             Aroka_Blacklist[name] = (GetTime() or 0) + 0.7
         end
         return
+    end
+end)
+
+-- If a cast fails/gets interrupted, don't hold the full 1.3s; release quickly.
+local aroka_castf = CreateFrame("Frame")
+aroka_castf:RegisterEvent("SPELLCAST_FAILED")
+aroka_castf:RegisterEvent("SPELLCAST_INTERRUPTED")
+aroka_castf:SetScript("OnEvent", function()
+    local now = GetTime and GetTime() or 0
+    -- If we still have a chunky lock, trim it to a short grace so spamming feels snappy
+    if (Aroka_NextCastAt or 0) - now > 0.5 then
+        Aroka_NextCastAt = now + 0.20
     end
 end)
 
