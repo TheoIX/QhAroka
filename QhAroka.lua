@@ -1,5 +1,6 @@
 -- QhAroka (Shaman) – Turtle WoW 1.12
 -- Downranking + smart targeting + AS→HW gate + LOS blacklist + Healing Way preference
+-- + NEW: /arokach toggle (default OFF) to force Chain Heal to highest known rank on /aroka only
 -- Updated: robust tooltip-based buff detection (with player-only fallback), target-restore, 2s LOS blacklist, 1.3s cast buffer
 
 ------------------------------------------------------------
@@ -206,6 +207,14 @@ local function Aroka_GetKnownRanks(spellName)
     return ranks
 end
 
+-- NEW: Return the highest known rank as an explicit "Name(Rank X)" string (fallback to base name)
+local function Aroka_MaxRankName(spellName)
+    local ranks = Aroka_GetKnownRanks(spellName)
+    if tlen(ranks) == 0 then return spellName end
+    local maxr = ranks[tlen(ranks)]
+    return string.format("%s(Rank %d)", spellName, maxr)
+end
+
 local BASE_HEAL = {
     ["Healing Wave"] = {
         [1]=34,[2]=64,[3]=129,[4]=268,[5]=376,[6]=506,[7]=678,[8]=879,[9]=1115,[10]=1367,[11]=1620,[12]=1900
@@ -375,24 +384,28 @@ local function Aroka_CountBelow(threshold)
 end
 
 ------------------------------------------------------------
+-- NEW: Chain Heal max‑rank toggle state (default OFF)
+------------------------------------------------------------
+local Aroka_CHForceMax = false
+
+------------------------------------------------------------
 -- Main runner
 ------------------------------------------------------------
 local function Aroka_Run(useMax)
-if not Aroka_CanScanNow() then return end
+    if not Aroka_CanScanNow() then return end
     Aroka_ArmScanThrottle()
     local target = Aroka_FindBestHealTarget()
     if not target then return end
 
-   local targetPct   = UnitHealthPct(target)
-local feverProc   = HasFeverDreamProc()
-local aswift      = HasBuff("player", "Ancestral Swiftness")
-local chainEligible = (Aroka_CountBelow(85) >= 3)
-
+    local targetPct     = UnitHealthPct(target)
+    local feverProc     = HasFeverDreamProc()
+    local aswift        = HasBuff("player", "Ancestral Swiftness")
+    local chainEligible = (Aroka_CountBelow(85) >= 3)
 
     -- EMERGENCY: if our chosen heal target is <=50% HP, pop Ancestral Swiftness first (if ready & not up),
     -- then use Healing Wave. This mirrors the intended behavior without touching your current target.
     -- EMERGENCY only if CH is NOT eligible
-        if (not chainEligible) and (targetPct <= 50) then
+    if (not chainEligible) and (targetPct <= 50) then
         -- Emergency rule: only cast Healing Wave if AS is active or Fever Dream is up.
         -- Otherwise, prefer LHW. If AS is ready and not active, pop it first and return.
         if (not aswift) and IsSpellReadyByName("Ancestral Swiftness") then
@@ -427,28 +440,33 @@ local chainEligible = (Aroka_CountBelow(85) >= 3)
     end
 
     -- Normal priority
-local spell
-if chainEligible then
-    spell = "Chain Heal"
-elseif feverProc then
-    spell = "Healing Wave"
-else
-    spell = "Lesser Healing Wave"
-end
-
-    if not useMax then
-        spell = Aroka_PickRank(spell, target)
-    end
-
-    -- If AS is active, always prefer Healing Wave regardless of the above
-   -- If AS is active, prefer Healing Wave, but never override Chain Heal
-if aswift and not string.find(spell, "Chain Heal", 1, true) then
-    if not useMax then
-        spell = Aroka_PickRank("Healing Wave", target)
-    else
+    local spell
+    if chainEligible then
+        spell = "Chain Heal"
+    elseif feverProc then
         spell = "Healing Wave"
+    else
+        spell = "Lesser Healing Wave"
     end
-end
+
+    -- Rank selection
+    if not useMax then
+        if Aroka_CHForceMax and string.find(spell, "Chain Heal", 1, true) then
+            -- Force highest known CH rank on /aroka when toggle is ON
+            spell = Aroka_MaxRankName("Chain Heal")
+        else
+            spell = Aroka_PickRank(spell, target)
+        end
+    end
+
+    -- If AS is active, prefer Healing Wave, but never override Chain Heal
+    if aswift and not string.find(spell, "Chain Heal", 1, true) then
+        if not useMax then
+            spell = Aroka_PickRank("Healing Wave", target)
+        else
+            spell = "Healing Wave"
+        end
+    end
 
     -- Range protection: blacklist and bail if not in range
     local inRange = IsUnitInRange(target)
@@ -488,7 +506,7 @@ end
 local aroka_loadf = CreateFrame("Frame")
 aroka_loadf:RegisterEvent("ADDON_LOADED")
 aroka_loadf:SetScript("OnEvent", function()
-    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka loaded (Shaman) — /aroka, /arokamax", 0, 1, 0) end
+    if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage("QhAroka loaded (Shaman) — /aroka, /arokamax, /arokach", 0, 1, 0) end
 end)
 
 ------------------------------------------------------------
@@ -555,6 +573,22 @@ SlashCmdList["QHAROKA"] = function(msg) Aroka_Run(false) end
 
 SLASH_QHAROKAMAX1 = "/arokamax"
 SlashCmdList["QHAROKAMAX"] = function(msg) Aroka_Run(true) end
+
+-- NEW: /arokach toggle: forces Chain Heal to max rank when using /aroka (downrank path). /arokamax unaffected.
+SLASH_QHAROKACH1 = "/arokach"
+SlashCmdList["QHAROKACH"] = function(msg)
+    msg = string.lower(msg or "")
+    if msg == "on" or msg == "1" or msg == "enable" or msg == "enabled" then
+        Aroka_CHForceMax = true
+    elseif msg == "off" or msg == "0" or msg == "disable" or msg == "disabled" then
+        Aroka_CHForceMax = false
+    else
+        Aroka_CHForceMax = not Aroka_CHForceMax
+    end
+    if DEFAULT_CHAT_FRAME then
+        DEFAULT_CHAT_FRAME:AddMessage(string.format("QhAroka: Chain Heal max-rank on /aroka %s", Aroka_CHForceMax and "|cff00ff00ENABLED|r" or "|cffff2020DISABLED|r"), 0.4, 0.8, 1)
+    end
+end
 
 SLASH_QHAROKAPING1 = "/arokaping"
 SlashCmdList["QHAROKAPING"] = function(msg)
