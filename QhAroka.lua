@@ -381,8 +381,16 @@ for _, u in pairs(units) do
         local realPct = UnitHealthPct(u)
         if realPct < minRealPct then minRealPct = realPct end
 
-        local score = realPct
-        if HasBuff(u, "Healing Way") then score = score - 5 end
+       -- Do NOT bias if the unit is truly full (current HP == max HP).
+local score = realPct
+do
+  local ch = UnitHealth(u) or 0
+  local mh = UnitHealthMax(u) or 0
+  local isTrueFull = (mh > 0 and ch >= mh)
+  if (not isTrueFull) and HasBuff(u, "Healing Way") then
+    score = score - 5
+  end
+end
 
         if score < bestScore then best, bestScore = u, score end
       end
