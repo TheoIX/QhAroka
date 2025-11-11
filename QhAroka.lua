@@ -38,6 +38,19 @@ local function UnitHealthPct(unit)
     return pct
 end
 
+-- NEW: guaranteed-cast on unit by briefly targeting then restoring.
+local function Aroka_TargetSwapCast(unit, spellNameWithOptionalRank)
+  local hadTarget = UnitExists("target")
+  local alreadyOnUnit = (hadTarget and UnitIsUnit("target", unit))
+
+  if not alreadyOnUnit then TargetUnit(unit) end
+  CastSpellByName(spellNameWithOptionalRank)
+  if not alreadyOnUnit then
+    if hadTarget then TargetLastTarget() else ClearTarget() end
+  end
+  return true
+end
+
 -- Cast throttle (affects all spells except Ancestral Swiftness)
 local AROKA_CAST_THROTTLE = 0
 local Aroka_NextCastAt = 0
@@ -178,15 +191,19 @@ local function Aroka_CastThrough(unit, spellNameWithOptionalRank)
 end
 
 --------------------------------------------------------
+-- REPLACE the function body:
 local function Aroka_SafeCastOnUnitByName(spellNameWithOptionalRank, unit)
-    -- Respect the cast throttle (AS still bypasses via Aroka_CanCastNow)
-    if not Aroka_CanCastNow(spellNameWithOptionalRank) then return false end
+  if not Aroka_CanCastNow(spellNameWithOptionalRank) then return false end
+  Aroka_ArmCastThrottle(spellNameWithOptionalRank)
 
-    -- Arm the cast throttle at the START of the cast to front-load the delay
-    Aroka_ArmCastThrottle(spellNameWithOptionalRank)
+  -- If we already have the right unit targeted, just cast.
+  if UnitExists("target") and UnitIsUnit("target", unit) then
+    CastSpellByName(spellNameWithOptionalRank)
+    return true
+  end
 
-    -- Now try to cast through; if it fails, we’ll relax the throttle via events below
-    return Aroka_CastThrough(unit, spellNameWithOptionalRank)
+  -- Otherwise, do a brief target swap and restore.
+  return Aroka_TargetSwapCast(unit, spellNameWithOptionalRank)
 end
 
 
