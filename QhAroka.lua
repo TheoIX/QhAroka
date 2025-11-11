@@ -371,20 +371,25 @@ local function Aroka_FindBestHealTarget()
     local best, bestScore = nil, 101       -- score = realPct with Healing Way bias
     local minRealPct = 101                 -- actual (unbiased) lowest health in the raid
 
-    for _, u in pairs(units) do
-        if IsHealable(u) then
-            local name = UnitNameSafe(u)
-            if name and not Aroka_IsBlacklisted(name) then
-                local realPct = UnitHealthPct(u)
-                if realPct < minRealPct then minRealPct = realPct end
+-- Inside Aroka_FindBestHealTarget(), in the for _, u in pairs(units) loop:
+for _, u in pairs(units) do
+  if IsHealable(u) then
+    -- NEW: don't consider self unless at or below 50% HP
+    if not (u == "player" and UnitHealthPct("player") > 50) then
+      local name = UnitNameSafe(u)
+      if name and not Aroka_IsBlacklisted(name) then
+        local realPct = UnitHealthPct(u)
+        if realPct < minRealPct then minRealPct = realPct end
 
-                local score = realPct
-                if HasBuff(u, "Healing Way") then score = score - 5 end -- bias for tie‑breaking only
+        local score = realPct
+        if HasBuff(u, "Healing Way") then score = score - 5 end
 
-                if score < bestScore then best, bestScore = u, score end
-            end
-        end
+        if score < bestScore then best, bestScore = u, score end
+      end
     end
+  end
+end
+
 
     -- If the *actual* health of everyone is 100%, do nothing
     if minRealPct >= 100 then return nil end
