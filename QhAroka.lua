@@ -7,6 +7,7 @@
 -- Constants / helpers
 ------------------------------------------------------------
 local BOOKTYPE_SPELL = "spell"
+local AROKA_HW_GATE_PCT = 40
 
 -- small Lua 5.0 helpers
 local function tlen(t) return table.getn(t) end
@@ -443,20 +444,22 @@ local function Aroka_Run(useMax)
             return
         end
 
-        local spell
-        if aswift or feverProc then
-            if not useMax then
-                spell = Aroka_PickRank("Healing Wave", target)
-            else
-                spell = "Healing Wave"
-            end
-        else
-            if not useMax then
-                spell = Aroka_PickRank("Lesser Healing Wave", target)
-            else
-                spell = "Lesser Healing Wave"
-            end
-        end
+   local spell
+-- HW only if target is <= 40% (even during emergency)
+if (aswift or feverProc) and (targetPct <= AROKA_HW_GATE_PCT) then
+  if not useMax then
+    spell = Aroka_PickRank("Healing Wave", target)
+  else
+    spell = "Healing Wave"
+  end
+else
+  if not useMax then
+    spell = Aroka_PickRank("Lesser Healing Wave", target)
+  else
+    spell = "Lesser Healing Wave"
+  end
+end
+
 
         local inRange = IsUnitInRange(target)
         if inRange == false then
@@ -473,8 +476,8 @@ local function Aroka_Run(useMax)
     local spell
     if chainEligible then
         spell = "Chain Heal"
-    elseif feverProc then
-        spell = "Healing Wave"
+    elseif feverProc and (targetPct <= AROKA_HW_GATE_PCT) then
+  spell = "Healing Wave"
     else
         spell = "Lesser Healing Wave"
     end
@@ -490,7 +493,7 @@ local function Aroka_Run(useMax)
     end
 
     -- If AS is active, prefer Healing Wave, but never override Chain Heal
-    if aswift and not string.find(spell, "Chain Heal", 1, true) then
+    if aswift and (targetPct <= AROKA_HW_GATE_PCT) and not string.find(spell, "Chain Heal", 1, true) then
         if not useMax then
             spell = Aroka_PickRank("Healing Wave", target)
         else
