@@ -431,7 +431,7 @@ local function Aroka_Run(useMax)
     local targetPct     = UnitHealthPct(target)
     local feverProc     = HasFeverDreamProc()
     local aswift        = HasBuff("player", "Ancestral Swiftness")
-    local chainEligible = (Aroka_CountBelow(85) >= 3)
+    local chainEligible = (Aroka_CountBelow(92) >= 3)
 
     -- EMERGENCY: if our chosen heal target is <=50% HP, pop Ancestral Swiftness first (if ready & not up),
     -- then use Healing Wave. This mirrors the intended behavior without touching your current target.
